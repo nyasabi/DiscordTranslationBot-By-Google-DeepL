@@ -42,7 +42,7 @@ GOOGLE_ENDPOINT = "https://translation.googleapis.com/language/translate/v2"
 GOOGLE_TIMEOUT = 15
 
 # 起動ログに表示。新しいコードが動いているかの確認用
-BOT_VERSION = "9-google"
+BOT_VERSION = "10-google"
 
 # 翻訳対象の最大文字数（長すぎるメッセージは拒否）
 MAX_SOURCE_CHARS = 4000
@@ -157,8 +157,12 @@ intents.guilds = True
 intents.messages = True
 # メッセージ本文を読むために必要（Developer Portal で Message Content Intent を ON にすること）
 intents.message_content = True
+# !t-whitelist add all でサーバーの全メンバーを取得するために必要（Developer Portal で Server Members Intent を ON にすること）
+intents.members = True
 
-client = discord.Client(intents=intents)
+# 起動時に全サーバーのメンバーを取得しない（起動が遅くなり、メモリも使うため）。
+# メンバー一覧は !t-whitelist add all を実行したときに、そのサーバーの分だけ取得する
+client = discord.Client(intents=intents, chunk_guilds_at_startup=False)
 
 http_session: aiohttp.ClientSession | None = None
 
@@ -222,6 +226,115 @@ def save_except() -> None:
 
 
 except_channels: dict[int, set[int]] = load_except()
+
+
+# ホワイトリスト（サーバーごと）。ON のときは許可リストのユーザー（と管理者）だけが翻訳できる
+# bot_google.py と bot_owner_google.py で同じファイルを共有する。もう一方の BOT が書き換えたら、更新時刻の変化を見て読み直す
+WHITELIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whitelist.json")
+
+whitelist_enabled: set[int] = set()
+whitelist_users: dict[int, set[int]] = {}
+# 最後に読み込んだ／保存したときの whitelist.json の更新時刻
+_whitelist_mtime: int | None = None
+# 読み込みに失敗したときの更新時刻（同じ壊れたファイルでエラーログを出し続けないため）
+_whitelist_bad_mtime: int | None = None
+
+
+def _whitelist_mtime_now() -> int | None:
+    try:
+        return os.stat(WHITELIST_FILE).st_mtime_ns
+    except FileNotFoundError:
+        return None
+
+
+def _parse_whitelist(data) -> tuple[set[int], dict[int, set[int]]]:
+    """{"サーバーID": {"enabled": bool, "users": [ユーザーID, ...]}} を読む。形式が不正なら例外を投げる。"""
+    if not isinstance(data, dict):
+        raise ValueError("whitelist.json の形式が不正です")
+    enabled: set[int] = set()
+    users: dict[int, set[int]] = {}
+    for g, v in data.items():
+        if not isinstance(v, dict) or not isinstance(v.get("users", []), list):
+            raise ValueError(f"whitelist.json のサーバー {g} の形式が不正です")
+        if v.get("enabled"):
+            enabled.add(int(g))
+        users[int(g)] = {int(u) for u in v.get("users", [])}
+    return enabled, users
+
+
+def refresh_whitelist(strict: bool = False) -> None:
+    """whitelist.json が前回から変わっていれば読み直す。
+
+    読み込みに失敗した場合、strict なら例外を投げ、そうでなければ前回の内容を使い続ける
+    （ファイルが壊れたときに、許可リストが黙って外れて誰でも翻訳できる状態にならないようにするため）。
+    ファイルが消えた場合も前回の内容を使い続ける。
+    """
+    global whitelist_enabled, whitelist_users, _whitelist_mtime, _whitelist_bad_mtime
+    mtime = _whitelist_mtime_now()
+    if mtime is None or mtime in (_whitelist_mtime, _whitelist_bad_mtime):
+        return
+    try:
+        with open(WHITELIST_FILE, encoding="utf-8") as f:
+            enabled, users = _parse_whitelist(json.load(f))
+    except Exception:
+        if strict:
+            raise
+        _whitelist_bad_mtime = mtime
+        log.exception("whitelist.json の読み込みに失敗したため、前回の内容を使い続けます")
+        return
+    whitelist_enabled, whitelist_users, _whitelist_mtime = enabled, users, mtime
+
+
+def save_whitelist(enabled: set[int], users: dict[int, set[int]]) -> None:
+    global _whitelist_mtime
+    # 2つの BOT が同時に保存しても一時ファイルがぶつからないよう、プロセスごとに名前を分ける
+    tmp = f"{WHITELIST_FILE}.{os.getpid()}.tmp"
+    guilds = enabled | {g for g, u in users.items() if u}
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                str(g): {"enabled": g in enabled, "users": sorted(users.get(g, ()))}
+                for g in guilds
+            },
+            f,
+        )
+    os.replace(tmp, WHITELIST_FILE)
+    _whitelist_mtime = _whitelist_mtime_now()
+
+
+def update_whitelist(guild_id: int, change) -> str:
+    """最新の whitelist.json を読み直してから change を適用して保存し、返信文を返す。
+
+    change(enabled, users) は (新しい enabled, 新しい users, 返信文) を返す。
+    保存に失敗したときはメモリ上の内容も変えずに例外を投げる。
+    """
+    global whitelist_enabled, whitelist_users
+    refresh_whitelist()
+    enabled = guild_id in whitelist_enabled
+    users = set(whitelist_users.get(guild_id, ()))
+    new_enabled, new_users, text = change(enabled, users)
+    if new_enabled == enabled and new_users == users:
+        return text
+    all_enabled = whitelist_enabled | {guild_id} if new_enabled else whitelist_enabled - {guild_id}
+    all_users = {**whitelist_users, guild_id: new_users}
+    save_whitelist(all_enabled, all_users)
+    whitelist_enabled, whitelist_users = all_enabled, all_users
+    return text
+
+
+try:
+    refresh_whitelist(strict=True)
+except Exception:
+    log.critical("whitelist.json を読み込めません。ファイルを修正するか削除してから起動してください。")
+    raise
+
+
+def whitelist_allows(guild_id: int, user_id: int) -> bool:
+    """ホワイトリストが OFF、または許可リストに入っていれば True（管理者の判定は呼び出し側で行う）。"""
+    refresh_whitelist()
+    if guild_id not in whitelist_enabled:
+        return True
+    return user_id in whitelist_users.get(guild_id, ())
 
 
 class SameLanguageError(Exception):
@@ -434,9 +547,6 @@ def split_for_discord(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str
 
 @client.event
 async def on_ready():
-    global http_session
-    if http_session is None:
-        http_session = aiohttp.ClientSession()
     log.info("Logged in as %s (id=%s)", client.user, client.user.id)
     log.info("bot version: %s", BOT_VERSION)
 
@@ -457,8 +567,14 @@ HELP_TEXT = (
     "`!t-unban @ユーザー` : 禁止を解除します。\n"
     "`!t-except add [#チャンネル]` : 例外チャンネルに追加します（省略すると今のチャンネル）。\n"
     "`!t-except remove [#チャンネル]` : 例外チャンネルから外します。\n"
-    "`!t-except list` : 例外チャンネルの一覧を表示します。\n\n"
-    "例外チャンネルでは、管理者権限を持つ人だけが翻訳できます。"
+    "`!t-except list` : 例外チャンネルの一覧を表示します。\n"
+    "`!t-whitelist on` / `off` : ホワイトリストモードを切り替えます。\n"
+    "`!t-whitelist add all` : 今サーバーにいる全員を許可リストに追加します（後から入った人は含まれません）。\n"
+    "`!t-whitelist add @ユーザー` : そのユーザーを許可リストに追加します。\n"
+    "`!t-whitelist remove @ユーザー` : 許可リストから外します。\n"
+    "`!t-whitelist list` : 状態と許可リストの人数を表示します。\n\n"
+    "例外チャンネルでは、管理者権限を持つ人だけが翻訳できます。\n"
+    "ホワイトリストモードが ON のときは、許可リストに入っている人（と管理者）だけが翻訳できます。"
 )
 
 
@@ -474,21 +590,26 @@ async def handle_t_t(message: discord.Message, arg: str) -> None:
     no_mentions = discord.AllowedMentions.none()
     usage = "使い方: `!t-t 🇺🇸 翻訳したい文章`（国旗の絵文字のあとに文章を書いてください）"
 
-    arg = arg.strip()
-    flag = arg[:2]
-    text = arg[2:].strip()
-    if flag not in FLAG_LANGUAGES or not text:
-        await message.reply(usage, mention_author=False, allowed_mentions=no_mentions)
-        return
-
     # 禁止ユーザー・例外チャンネルでは、リアクション翻訳と同じく何もしない
     if message.author.id in banned_users.get(message.guild.id, ()):
+        return
+    # ホワイトリストモードでは、許可リストにない人（管理者を除く）は何もしない
+    if not whitelist_allows(message.guild.id, message.author.id) and not is_admin_member(
+        message.author
+    ):
         return
     restricted = except_channels.get(message.guild.id, set())
     parent_id = getattr(message.channel, "parent_id", None)
     if (message.channel.id in restricted or (parent_id and parent_id in restricted)) and not is_admin_member(
         message.author
     ):
+        return
+
+    arg = arg.strip()
+    flag = arg[:2]
+    text = arg[2:].strip()
+    if flag not in FLAG_LANGUAGES or not text:
+        await message.reply(usage, mention_author=False, allowed_mentions=no_mentions)
         return
 
     if len(text) > MAX_SOURCE_CHARS:
@@ -534,7 +655,7 @@ async def on_message(message: discord.Message):
 
     cmd, _, arg = message.content.strip().partition(" ")
     cmd = cmd.lower()
-    if cmd not in ("!help", "!t-t", "!ping", "!t-ban", "!t-unban", "!t-except"):
+    if cmd not in ("!help", "!t-t", "!ping", "!t-ban", "!t-unban", "!t-except", "!t-whitelist"):
         return
 
     # !help は誰でも使える
@@ -608,6 +729,97 @@ async def on_message(message: discord.Message):
         await message.reply(text, mention_author=False, allowed_mentions=no_mentions)
         return
 
+    # --- !t-whitelist on / off / add all / add <ID> / remove <ID> / list ---
+    if cmd == "!t-whitelist":
+        no_mentions = discord.AllowedMentions.none()
+        guild = message.guild
+        sub, _, rest = arg.strip().partition(" ")
+        sub = sub.lower()
+        rest = rest.strip()
+        # 変更内容は change にまとめ、最後に update_whitelist で適用する
+        # （await を挟まずに「読み直し → 変更 → 保存」するので、もう一方の BOT の変更を消さない）
+        change = None
+        text = ""
+
+        if sub == "on":
+            def change(enabled, users):
+                return True, users, (
+                    f"🔒 ホワイトリストモードを ON にしました（許可リスト: {len(users)}人）。"
+                    "許可された人と管理者だけが翻訳できます。"
+                )
+        elif sub in ("off", "of"):
+            def change(enabled, users):
+                return False, users, "🔓 ホワイトリストモードを OFF にしました。"
+        elif sub == "list":
+            refresh_whitelist()
+            state = "ON" if guild.id in whitelist_enabled else "OFF"
+            count = len(whitelist_users.get(guild.id, ()))
+            text = f"ホワイトリストモード: **{state}** / 許可リスト: {count}人"
+        elif sub == "add" and rest.lower() == "all":
+            # 「今」サーバーにいるメンバー（BOT を除く）だけを追加する
+            async with message.channel.typing():
+                try:
+                    members = guild.members if guild.chunked else await guild.chunk()
+                except Exception:
+                    log.exception("メンバー一覧の取得に失敗しました")
+                    members = []
+            ids = {m.id for m in members if not m.bot}
+            if not ids:
+                text = (
+                    "メンバー一覧を取得できませんでした。"
+                    "Developer Portal で Server Members Intent が ON になっているか確認してください。"
+                )
+            else:
+                def change(enabled, users):
+                    added = len(ids - users)
+                    users = users | ids
+                    return enabled, users, (
+                        f"✅ 今サーバーにいる {len(ids)}人 を許可リストに追加しました"
+                        f"（新規 {added}人 / 合計 {len(users)}人）。"
+                    )
+        elif sub in ("add", "remove"):
+            m = _ID_PATTERN.search(rest)
+            if not m:
+                text = f"使い方: `!t-whitelist {sub} @ユーザー` または `!t-whitelist {sub} ユーザーID`"
+            elif sub == "add":
+                target_id = int(m.group())
+                # ロールやチャンネルの ID、存在しない ID を登録しないよう、ユーザーとして存在するか確認する
+                if client.get_user(target_id) is None:
+                    try:
+                        await client.fetch_user(target_id)
+                    except discord.NotFound:
+                        text = f"ID `{target_id}` のユーザーが見つかりません。"
+                    except discord.HTTPException:
+                        log.exception("ユーザーの確認に失敗しました")
+                        text = "ユーザーの確認に失敗しました。しばらくしてからもう一度お試しください。"
+                if not text:
+                    def change(enabled, users):
+                        if target_id in users:
+                            return enabled, users, f"<@{target_id}> はすでに許可リストに入っています。"
+                        return enabled, users | {target_id}, f"✅ <@{target_id}> を許可リストに追加しました。"
+            else:
+                target_id = int(m.group())
+
+                def change(enabled, users):
+                    if target_id not in users:
+                        return enabled, users, f"<@{target_id}> は許可リストに入っていません。"
+                    return enabled, users - {target_id}, f"🗑️ <@{target_id}> を許可リストから外しました。"
+        else:
+            text = (
+                "使い方: `!t-whitelist on` / `!t-whitelist off` / `!t-whitelist add all` / "
+                "`!t-whitelist add ユーザーID` / `!t-whitelist remove ユーザーID` / `!t-whitelist list`"
+            )
+
+        if change is not None:
+            try:
+                text = update_whitelist(guild.id, change)
+            except Exception:
+                log.exception("whitelist.json の保存に失敗しました")
+                text = "⚠️ 設定を保存できなかったため、変更していません。しばらくしてからもう一度お試しください。"
+
+        await message.reply(text, mention_author=False, allowed_mentions=no_mentions)
+        return
+
     # --- !t-ban / !t-unban: メンションまたはユーザーIDを指定 ---
     no_mentions = discord.AllowedMentions.none()
     m = _ID_PATTERN.search(arg)
@@ -667,6 +879,20 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     flag = str(payload.emoji)
     if flag not in FLAG_LANGUAGES:
         return
+
+    # ホワイトリストモードでは、許可リストにない人（管理者を除く）のリアクションは無反応
+    if payload.guild_id and not whitelist_allows(payload.guild_id, payload.user_id):
+        member = payload.member
+        if member is None:
+            guild = client.get_guild(payload.guild_id)
+            try:
+                member = guild.get_member(payload.user_id) or await guild.fetch_member(
+                    payload.user_id
+                )
+            except Exception:
+                member = None
+        if not is_admin_member(member):
+            return
 
     # 例外チャンネル（スレッドの場合は親チャンネルも対象）では、管理者権限を持つ人だけが翻訳できる
     if payload.guild_id:
@@ -765,13 +991,13 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
 
 async def main():
-    async with client:
-        await client.start(DISCORD_TOKEN)
+    global http_session
+    # BOT の接続より先に作っておく（on_ready より前に届いたリアクションでも翻訳できるように）
+    async with aiohttp.ClientSession() as session:
+        http_session = session
+        async with client:
+            await client.start(DISCORD_TOKEN)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    finally:
-        if http_session and not http_session.closed:
-            asyncio.run(http_session.close())
+    asyncio.run(main())
